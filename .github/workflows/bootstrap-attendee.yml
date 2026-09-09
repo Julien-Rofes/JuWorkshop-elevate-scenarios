@@ -1,0 +1,143 @@
+name: Bootstrap batch and launch generators
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace_uuid:
+        description: Parent workspace or community UUID
+        required: true
+        type: string
+      community_count:
+        description: Number of communities to create
+        required: true
+        default: '1'
+        type: string
+      starting_suffix:
+        description: Starting suffix, for example 1, 100, or 001
+        required: true
+        default: '001'
+        type: string
+      ioc_ip:
+        description: Public IOC IP address for the FortiGate generator
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  bootstrap-and-launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Create communities, aggregate secrets, and generators
+        env:
+          COMMUNITY_API_KEY: ${{ secrets.SEKOIA_COMMUNITY_API_KEY }}
+          INTAKE_API_KEY: ${{ secrets.SEKOIA_INTAKE_API_KEY }}
+          GH_TOKEN: ${{ secrets.BOOTSTRAP_GITHUB_TOKEN }}
+          WORKSPACE_UUID: ${{ inputs.workspace_uuid }}
+          COMMUNITY_COUNT: ${{ inputs.community_count }}
+          STARTING_SUFFIX: ${{ inputs.starting_suffix }}
+          IOC_IP: ${{ inputs.ioc_ip }}
+          OUTPUT_FILE: ${{ runner.temp }}/attendee-batch.jsonl
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          for required in COMMUNITY_API_KEY INTAKE_API_KEY GH_TOKEN WORKSPACE_UUID; do
+            if [[ -z "${!required}" ]]; then
+              echo "Missing required value: ${required}" >&2
+              exit 1
+            fi
+          done
+
+          if ! [[ "${COMMUNITY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "community_count must be a positive integer." >&2
+            exit 1
+          fi
+          if (( COMMUNITY_COUNT > 30 )); then
+            echo "community_count cannot exceed 30." >&2
+            exit 1
+          fi
+          if ! [[ "${STARTING_SUFFIX}" =~ ^[0-9]+$ ]]; then
+            echo "starting_suffix must contain digits only." >&2
+            exit 1
+          fi
+
+          DATE_KEY="$(date -u +%d_%m_%Y)"
+          SUFFIX_WIDTH="${#STARTING_SUFFIX}"
+          STARTING_NUMBER=$((10#${STARTING_SUFFIX}))
+          BATCH_PREFIX="A_${DATE_KEY}_BATCH_${STARTING_SUFFIX}_N${COMMUNITY_COUNT}"
+          FORTIGATE_TARGETS_SECRET="${BATCH_PREFIX}_FORTIGATE_INTAKES"
+          HTTP_TARGETS_SECRET="${BATCH_PREFIX}_HTTP_INTAKES"
+          WINDOWS_TARGETS_SECRET="${BATCH_PREFIX}_WINDOWS_INTAKES"
+          REVEAL_TARGETS_SECRET="${BATCH_PREFIX}_REVEAL_INTAKES"
+
+          EXISTING_SECRETS_FILE="${RUNNER_TEMP}/existing-secrets.txt"
+          gh secret list --repo "${GITHUB_REPOSITORY}" --json name --jq '.[].name' > "${EXISTING_SECRETS_FILE}"
+          for secret_name in "${FORTIGATE_TARGETS_SECRET}" "${HTTP_TARGETS_SECRET}" "${WINDOWS_TARGETS_SECRET}" "${REVEAL_TARGETS_SECRET}"; do
+            if grep -Fxq "${secret_name}" "${EXISTING_SECRETS_FILE}"; then
+              echo "Refusing to overwrite existing repository secret: ${secret_name}" >&2
+              exit 1
+            fi
+          done
+
+          bash scripts/create_attendee_community_with_intakes.sh
+
+          FORTIGATE_TARGETS_JSON="$(jq -c -s '[.[] | {suffix: .suffix, community_uuid: .community_uuid, intake_key: .fortigate_key}]' "${OUTPUT_FILE}")"
+          HTTP_TARGETS_JSON="$(jq -c -s '[.[] | {suffix: .suffix, community_uuid: .community_uuid, intake_key: .http_key}]' "${OUTPUT_FILE}")"
+          WINDOWS_TARGETS_JSON="$(jq -c -s '[.[] | {suffix: .suffix, community_uuid: .community_uuid, intake_key: .windows_key}]' "${OUTPUT_FILE}")"
+          REVEAL_TARGETS_JSON="$(jq -c -s '[.[] | {suffix: .suffix, community_uuid: .community_uuid, intake_key: .reveal_key}]' "${OUTPUT_FILE}")"
+          echo "::add-mask::${FORTIGATE_TARGETS_JSON}"
+          echo "::add-mask::${HTTP_TARGETS_JSON}"
+          echo "::add-mask::${WINDOWS_TARGETS_JSON}"
+          echo "::add-mask::${REVEAL_TARGETS_JSON}"
+
+          for secret_name in "${FORTIGATE_TARGETS_SECRET}" "${HTTP_TARGETS_SECRET}" "${WINDOWS_TARGETS_SECRET}" "${REVEAL_TARGETS_SECRET}"; do
+            if grep -Fxq "${secret_name}" "${EXISTING_SECRETS_FILE}"; then
+              echo "Refusing to overwrite existing repository secret: ${secret_name}" >&2
+              exit 1
+            fi
+          done
+
+          printf '%s' "${FORTIGATE_TARGETS_JSON}" | gh secret set "${FORTIGATE_TARGETS_SECRET}" --repo "${GITHUB_REPOSITORY}"
+          printf '%s' "${HTTP_TARGETS_JSON}" | gh secret set "${HTTP_TARGETS_SECRET}" --repo "${GITHUB_REPOSITORY}"
+          printf '%s' "${WINDOWS_TARGETS_JSON}" | gh secret set "${WINDOWS_TARGETS_SECRET}" --repo "${GITHUB_REPOSITORY}"
+          printf '%s' "${REVEAL_TARGETS_JSON}" | gh secret set "${REVEAL_TARGETS_SECRET}" --repo "${GITHUB_REPOSITORY}"
+
+          echo "Created ${COMMUNITY_COUNT} communities."
+          echo "Launching one generator workflow per log type."
+
+          gh workflow run send-windows.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "targets_secret_name=${WINDOWS_TARGETS_SECRET}"
+
+          gh workflow run send-fortigate.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "targets_secret_name=${FORTIGATE_TARGETS_SECRET}" \
+            -f "ioc_ip=${IOC_IP}"
+
+          gh workflow run send-http-access-logs.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "targets_secret_name=${HTTP_TARGETS_SECRET}"
+
+          gh workflow run send-modsec.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "targets_secret_name=${HTTP_TARGETS_SECRET}"
+
+          gh workflow run send-reveal-hygiene.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "targets_secret_name=${REVEAL_TARGETS_SECRET}"
+
+          rm -f "${OUTPUT_FILE}" "${EXISTING_SECRETS_FILE}"
+          echo "All four generator workflows were dispatched."
