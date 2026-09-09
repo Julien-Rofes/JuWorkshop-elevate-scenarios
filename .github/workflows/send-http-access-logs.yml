@@ -1,0 +1,29 @@
+name: Send HTTP access logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets_secret_name:
+        description: GitHub secret containing the JSON list of Apache targets
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  send-http-access-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Send HTTP access logs to all communities
+        env:
+          TARGETS_JSON: ${{ secrets[inputs.targets_secret_name] }}
+        run: |
+          if [[ -z "$TARGETS_JSON" ]]; then
+            echo "The requested target secret was not found or is empty." >&2
+            exit 1
+          fi
+          bash scripts/send_http_access_logs_v2.sh
