@@ -1,0 +1,34 @@
+name: Send FortiGate events
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets_secret_name:
+        description: GitHub secret containing the JSON list of FortiGate targets
+        required: true
+        type: string
+      ioc_ip:
+        description: Public IOC IP address to simulate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  send-fortigate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+      - name: Send FortiGate events to all communities
+        env:
+          TARGETS_JSON: ${{ secrets[inputs.targets_secret_name] }}
+          IOC_INPUT: ${{ inputs.ioc_ip }}
+        run: |
+          if [[ -z "$TARGETS_JSON" ]]; then
+            echo "The requested target secret was not found or is empty." >&2
+            exit 1
+          fi
+          bash scripts/send_fortigate_events_v3.sh
